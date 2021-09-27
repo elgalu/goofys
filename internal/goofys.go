@@ -178,16 +178,32 @@ func newGoofys(ctx context.Context, bucket string, flags *FlagStorage,
 	}
 
 	var prefix string
-	colon := strings.Index(bucket, ":")
-	if colon != -1 {
-		prefix = bucket[colon+1:]
-		prefix = strings.Trim(prefix, "/")
-		if prefix != "" {
-			prefix += "/"
+	if strings.HasPrefix(bucket, "arn:aws:s3:") {
+		var parts = strings.SplitN(bucket, ":", 7)
+		if len(parts) == 7 {
+			prefix = parts[6]
+			prefix = strings.Trim(prefix, "/")
+			if prefix != "" {
+				prefix += "/"
+			}
 		}
 
-		fs.bucket = bucket[0:colon]
+		var bucketArnParts = parts[0:6]
+		var bucketArn = strings.Join(bucketArnParts[:], ":")
+		fs.bucket = bucketArn
 		bucket = fs.bucket
+	} else {
+		colon := strings.Index(bucket, ":")
+		if colon != -1 {
+			prefix = bucket[colon+1:]
+			prefix = strings.Trim(prefix, "/")
+			if prefix != "" {
+				prefix += "/"
+			}
+
+			fs.bucket = bucket[0:colon]
+			bucket = fs.bucket
+		}
 	}
 
 	if flags.DebugS3 {

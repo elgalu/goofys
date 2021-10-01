@@ -313,6 +313,7 @@ func (s *GoofysTest) deleteBucket(cloud StorageBackend) error {
 
 func (s *GoofysTest) TearDownTest(t *C) {
 	close(s.timeout)
+	s.timeout = nil
 
 	for _, cloud := range s.removeBucket {
 		err := s.deleteBucket(cloud)
@@ -437,7 +438,10 @@ func (s *GoofysTest) setupDefaultEnv(t *C, public bool) {
 	s.setupEnv(t, s.env, public)
 }
 
-func (s *GoofysTest) setUpTestTimeout(t *C) {
+func (s *GoofysTest) setUpTestTimeout(t *C, timeout time.Duration) {
+	if s.timeout != nil {
+		close(s.timeout)
+	}
 	s.timeout = make(chan int)
 	debug.SetTraceback("all")
 	started := time.Now()
@@ -448,9 +452,9 @@ func (s *GoofysTest) setUpTestTimeout(t *C) {
 			if !ok {
 				return
 			}
-		case <-time.After(PerTestTimeout):
+		case <-time.After(timeout):
 			panic(fmt.Sprintf("timeout %v reached. Started %v now %v",
-				PerTestTimeout, started, time.Now()))
+				timeout, started, time.Now()))
 		}
 	}()
 }
@@ -458,7 +462,7 @@ func (s *GoofysTest) setUpTestTimeout(t *C) {
 func (s *GoofysTest) SetUpTest(t *C) {
 	log.Infof("Starting at %v", time.Now())
 
-	s.setUpTestTimeout(t)
+	s.setUpTestTimeout(t, PerTestTimeout)
 
 	var bucket string
 	mount := os.Getenv("MOUNT")
@@ -503,7 +507,7 @@ func (s *GoofysTest) SetUpTest(t *C) {
 		_, err = s3.ListBuckets(nil)
 		t.Assert(err, IsNil)
 
-	} else if cloud == "gcs" {
+	} else if cloud == "gcs3" {
 		conf := s.selectTestConfig(t, flags)
 		flags.Backend = &conf
 
@@ -608,6 +612,15 @@ func (s *GoofysTest) SetUpTest(t *C) {
 		flags.Backend = &config
 
 		s.cloud, err = NewADLv2(bucket, flags, &config)
+		t.Assert(err, IsNil)
+		t.Assert(s.cloud, NotNil)
+	} else if cloud == "gcs" {
+		config := NewGCSConfig()
+		t.Assert(config, NotNil)
+
+		flags.Backend = config
+		var err error
+		s.cloud, err = NewGCS(bucket, config)
 		t.Assert(err, IsNil)
 		t.Assert(s.cloud, NotNil)
 	} else {
@@ -1104,6 +1117,9 @@ func (s *GoofysTest) TestWriteLargeFile(t *C) {
 }
 
 func (s *GoofysTest) TestWriteReallyLargeFile(t *C) {
+	if _, ok := s.cloud.(*S3Backend); ok && s.emulator {
+		t.Skip("seems to be OOM'ing S3proxy 1.8.0")
+	}
 	s.testWriteFile(t, "testLargeFile", 512*1024*1024+1, 128*1024)
 }
 
@@ -1290,6 +1306,8 @@ func (s *GoofysTest) TestBackendListPagination(t *C) {
 		itemsPerPage = 1000
 	case *AZBlob, *ADLv2:
 		itemsPerPage = 5000
+	case *GCSBackend:
+		itemsPerPage = 1000
 	default:
 		t.Fatalf("unknown backend: %T", s.cloud)
 	}
@@ -1772,6 +1790,7 @@ func (s *GoofysTest) TestBenchLs(t *C) {
 	s.fs.flags.TypeCacheTTL = 1 * time.Minute
 	s.fs.flags.StatCacheTTL = 1 * time.Minute
 	mountPoint := "/tmp/mnt" + s.fs.bucket
+	s.setUpTestTimeout(t, 20*time.Minute)
 	s.runFuseTest(t, mountPoint, false, "../bench/bench.sh", "cat", mountPoint, "ls")
 }
 
@@ -3345,6 +3364,10 @@ func (s *GoofysTest) newBackend(t *C, bucket string, createBucket bool) (cloud S
 		config, _ := s.fs.flags.Backend.(*ADLv2Config)
 		cloud, err = NewADLv2(bucket, s.fs.flags, config)
 		t.Assert(err, IsNil)
+	case *GCSBackend:
+		config, _ := s.fs.flags.Backend.(*GCSConfig)
+		cloud, err = NewGCS(bucket, config)
+		t.Assert(err, IsNil)
 	default:
 		t.Fatal("unknown backend")
 	}
@@ -3578,6 +3601,19 @@ func (s *GoofysTest) TestMountsError(t *C) {
 		defer func() {
 			adlCloud.client.BaseClient.Authorizer = auth
 		}()
+	} else if _, ok := s.cloud.(*GCSBackend); ok {
+		// We'll trigger a failure on GCS mount by using an unauthenticated client to mount to a private bucket
+		defaultCreds := os.Getenv("GOOGLE_APPLICATION_CREDENTIALS")
+		os.Unsetenv("GOOGLE_APPLICATION_CREDENTIALS")
+
+		defer func() {
+			os.Setenv("GOOGLE_APPLICATION_CREDENTIALS", defaultCreds)
+		}()
+
+		var err error
+		config := NewGCSConfig()
+		cloud, err = NewGCS(s.fs.bucket, config)
+		t.Assert(err, IsNil)
 	} else {
 		cloud = s.newBackend(t, bucket, false)
 	}
@@ -4164,10 +4200,12 @@ func (s *GoofysTest) testReadMyOwnWriteFuse(t *C, externalUpdate bool) {
 	if !externalUpdate {
 		// we flushed and ttl expired, next lookup should
 		// realize nothing is changed and NOT invalidate the
-		// cache. Except ADLv1 because PUT there doesn't
+		// cache. Except ADLv1,GCS because PUT there doesn't
 		// return the mtime, so the open above will think the
 		// file is updated and not re-use cache
-		if _, adlv1 := s.cloud.(*ADLv1); !adlv1 {
+		_, adlv1 := s.cloud.(*ADLv1)
+		_, isGCS := s.cloud.(*GCSBackend)
+		if  !adlv1 && !isGCS {
 			cloud.err = fuse.EINVAL
 		}
 	} else {
